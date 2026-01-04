@@ -1,0 +1,12 @@
+{
+  "LIMITED_TICKERS": ["SPY", "NVDA", "QQQ", "AAPL", "MSFT", "AMZN"],
+  "FULL_TICKERS": [
+    "SPY", "NVDA", "QQQ", "AAPL", "MSFT", "AMZN", "IWM", "IVV", "GOOGL", "AMD",
+    "GOOG", "TLT", "NFLX", "UNH", "JPM", "V", "MU", "HYG", "BA", "WMT",
+    "XLF", "XOM", "LQD", "CVX", "DIA", "CSCO", "BAC", "PG", "GLD", "PFE"
+  ],
+  "TRAINING_END_DATE": "2024-12-31",
+  "TRADING_START_DATE": "2025-01-01",
+  "TRAINING_YEARS_BACK_LIMITED": 3,
+  "TRAINING_YEARS_BACK_FULL": null
+}

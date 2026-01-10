@@ -12,10 +12,14 @@ This module orchestrates the entire trading pipeline, including:
 import os
 import sys
 import json
+import random
 import logging
 from typing import Dict, Any, List, Optional
 from pathlib import Path
 import importlib.util
+import numpy as np
+import torch
+from simicx.trading_sim import trading_sim
 
 # Configure logging
 logging.basicConfig(
@@ -26,6 +30,42 @@ logger = logging.getLogger(__name__)
 
 # Get the directory containing this file
 CURRENT_DIR = Path(__file__).parent.absolute()
+
+
+def set_random_seeds(seed: int = 42) -> None:
+    """
+    Set random seeds for reproducibility across all random number generators.
+    
+    This ensures deterministic results when running inference with the same model.
+    Without this, results may vary due to:
+    - PyTorch backend initialization
+    - NumPy random operations
+    - Python's built-in random module
+    
+    Args:
+        seed: Random seed value (default: 42)
+    
+    Note:
+        Setting deterministic mode may slightly reduce performance but ensures
+        reproducible results across multiple runs with the same trained model.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    
+    if torch.backends.mps.is_available():
+        torch.mps.manual_seed(seed)
+    
+    # Make PyTorch operations deterministic
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    
+    logger.info(f"Random seeds set to {seed} for reproducibility")
+
 
 
 def _import_signal_gen():
@@ -68,28 +108,6 @@ def _import_data_loader():
     spec.loader.exec_module(data_loader)
     return data_loader
 
-
-def _import_trading_sim():
-    """
-    Dynamically import the trading_sim module.
-
-    Returns:
-        module: The imported trading_sim module
-    """
-    # First try simicx subdirectory (standard location per project structure)
-    trading_sim_path = CURRENT_DIR / "simicx" / "trading_sim.py"
-    if not trading_sim_path.exists():
-        # Fallback to current directory
-        trading_sim_path = CURRENT_DIR / "trading_sim.py"
-
-    if not trading_sim_path.exists():
-        raise ImportError(f"trading_sim.py not found at {trading_sim_path}")
-
-    spec = importlib.util.spec_from_file_location("trading_sim", trading_sim_path)
-    trading_sim = importlib.util.module_from_spec(spec)
-    sys.modules["trading_sim"] = trading_sim
-    spec.loader.exec_module(trading_sim)
-    return trading_sim
 
 
 def load_best_params(params_path: str) -> Dict[str, Any]:
@@ -148,16 +166,12 @@ def get_tickers_for_phase(phase: str) -> List[str]:
     """
     tickers_by_phase = {
         "limited": ["AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA"],
-        "expanded": [
-            "AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA",
-            "TSLA", "JPM", "V", "JNJ", "WMT", "PG"
-        ],
+
         "full": [
-            "AAPL", "GOOGL", "MSFT", "AMZN", "META", "NVDA",
-            "TSLA", "JPM", "V", "JNJ", "WMT", "PG",
-            "MA", "HD", "DIS", "PYPL", "NFLX", "ADBE",
-            "CRM", "INTC", "CSCO", "VZ", "T", "PFE"
-        ]
+    "SPY", "NVDA", "QQQ", "AAPL", "MSFT", "AMZN", "IWM", "IVV", "GOOGL", "AMD",
+    "GOOG", "TLT", "NFLX", "UNH", "JPM", "V", "MU", "HYG", "BA", "WMT",
+    "XLF", "XOM", "LQD", "CVX", "DIA", "CSCO", "BAC", "PG", "GLD", "PFE"
+  ],
     }
     
     if phase not in tickers_by_phase:
@@ -354,45 +368,51 @@ def run_production_pipeline(phase: str) -> Dict[str, Any]:
         print(f"      Generated {len(trading_sheet) if hasattr(trading_sheet, '__len__') else 'N/A'} trading signals")
         print()
         
-        results["trading_sheet"] = trading_sheet
+        results["signals"] = trading_sheet  # Rename for clarity
         
         # Step 4: Run trading simulation
         print("[4/5] Running trading simulation...")
         
-        trading_sim = _import_trading_sim()
+        # Pass raw signals to trading_sim with signal_type
+        # trading_sim will convert signals to trades and execute them
+        pnl, pnl_details = trading_sim(
+            signals=trading_sheet,  # DataFrame with [time, ticker, signal]
+            signal_type='TARGET_WEIGHT',  # Agent outputs portfolio weights
+            ohlcv_tickers=tickers,
+            initial_capital=initial_cash
+        )
         
-        if hasattr(trading_sim, 'run_simulation'):
-            sim_results = trading_sim.run_simulation(
-                trading_sheet=trading_sheet,
-                initial_cash=initial_cash,
-                tickers=tickers
-            )
-        elif hasattr(trading_sim, 'TradingSimulator'):
-            simulator = trading_sim.TradingSimulator(initial_cash=initial_cash)
-            sim_results = simulator.run(trading_sheet)
-        elif hasattr(trading_sim, 'simulate'):
-            sim_results = trading_sim.simulate(trading_sheet, initial_cash)
-        else:
-            # Fallback results
-            sim_results = {
-                "final_value": initial_cash * 1.05,
-                "total_return": 0.05,
-                "sharpe_ratio": 1.2,
-                "max_drawdown": -0.08
-            }
-        
-        print("      Simulation complete")
+        print(f"      Simulation complete. Final PnL: ${pnl:,.2f}")
         print()
         
-        results["simulation"] = sim_results
+        results["pnl"] = pnl
+        results["pnl_details"] = pnl_details
+        
+        # Save results
+        trading_sheet.to_csv("signals.csv", index=False)  # Raw signals
+        pnl_details.to_csv("pnl_details.csv", index=False)  # Execution details
         
         # Step 5: Calculate and display performance metrics
         print("[5/5] Calculating performance metrics...")
         
-        final_value = sim_results.get("final_value", sim_results.get("final_portfolio_value", initial_cash))
+        # Get metrics from pnl_details
+        final_value = pnl_details['portfolio_value'].iloc[-1] if len(pnl_details) > 0 else initial_cash
         total_return = (final_value - initial_cash) / initial_cash * 100
-        sharpe_ratio = sim_results.get("sharpe_ratio", 0.0)
-        max_drawdown = sim_results.get("max_drawdown", 0.0)
+        
+        # Calculate Sharpe ratio from returns
+        if len(pnl_details) > 1:
+            returns = pnl_details['portfolio_value'].pct_change().dropna()
+            sharpe_ratio = (returns.mean() /  returns.std()) * (252 ** 0.5) if returns.std() > 0 else 0.0
+        else:
+            sharpe_ratio = 0.0
+        
+        # Calculate max drawdown
+        if len(pnl_details) > 0:
+            cummax = pnl_details['portfolio_value'].cummax()
+            drawdown = (pnl_details['portfolio_value'] - cummax) / cummax
+            max_drawdown = drawdown.min() * 100
+        else:
+            max_drawdown = 0.0
         
         print()
         print("=" * 60)
@@ -450,8 +470,18 @@ def main() -> int:
         action="store_true",
         help="Run tests instead of production pipeline"
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed for reproducibility (default: 42). Set to -1 to disable."
+    )
     
     args = parser.parse_args()
+    
+    # Set random seeds for reproducibility (unless disabled)
+    if args.seed >= 0:
+        set_random_seeds(args.seed)
     
     if args.test:
         print("Running tests...")

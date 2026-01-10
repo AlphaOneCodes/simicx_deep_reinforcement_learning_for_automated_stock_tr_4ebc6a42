@@ -3,4 +3,4 @@ __pycache__/
 *.log
 .DS_Store
 .env
-best_params.json
+venv

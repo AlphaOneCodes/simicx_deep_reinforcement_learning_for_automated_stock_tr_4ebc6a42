@@ -89,13 +89,19 @@ def calc_features(ohlcv_df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
     
     features = pd.DataFrame(index=pivot_close.index)
     
+    # Collect all indicator DataFrames and concat at once (prevents fragmentation)
+    indicator_dfs = []
+    
     for ticker in tickers:
         if ticker not in pivot_close.columns:
             # Fill with default values if ticker not found
-            features[f'{ticker}_macd'] = 0.0
-            features[f'{ticker}_rsi'] = 50.0
-            features[f'{ticker}_cci'] = 0.0
-            features[f'{ticker}_adx'] = 25.0
+            default_df = pd.DataFrame({
+                f'{ticker}_macd': 0.0,
+                f'{ticker}_rsi': 50.0,
+                f'{ticker}_cci': 0.0,
+                f'{ticker}_adx': 25.0
+            }, index=pivot_close.index)
+            indicator_dfs.append(default_df)
             continue
         
         close = pivot_close[ticker].copy()
@@ -107,21 +113,25 @@ def calc_features(ohlcv_df: pd.DataFrame, tickers: List[str]) -> pd.DataFrame:
         high = high.ffill().bfill()
         low = low.ffill().bfill()
         
-        # MACD (12, 26, 9)
+        # Calculate all indicators for this ticker
         macd_indicator = ta.trend.MACD(close, window_slow=26, window_fast=12, window_sign=9)
-        features[f'{ticker}_macd'] = macd_indicator.macd()
-        
-        # RSI (14)
         rsi_indicator = ta.momentum.RSIIndicator(close, window=14)
-        features[f'{ticker}_rsi'] = rsi_indicator.rsi()
-        
-        # CCI (14)
         cci_indicator = ta.trend.CCIIndicator(high, low, close, window=14)
-        features[f'{ticker}_cci'] = cci_indicator.cci()
-        
-        # ADX (14)
         adx_indicator = ta.trend.ADXIndicator(high, low, close, window=14)
-        features[f'{ticker}_adx'] = adx_indicator.adx()
+        
+        # Create DataFrame with all indicators for this ticker
+        ticker_indicators = pd.DataFrame({
+            f'{ticker}_macd': macd_indicator.macd(),
+            f'{ticker}_rsi': rsi_indicator.rsi(),
+            f'{ticker}_cci': cci_indicator.cci(),
+            f'{ticker}_adx': adx_indicator.adx()
+        }, index=pivot_close.index)
+        
+        indicator_dfs.append(ticker_indicators)
+    
+    # Concatenate all indicator DataFrames at once (avoids fragmentation)
+    if indicator_dfs:
+        features = pd.concat(indicator_dfs, axis=1)
     
     # Handle NaNs with bfill then ffill
     features = features.bfill().ffill()
@@ -399,17 +409,407 @@ class A2CAgent(BaseAgent):
         self.agent_type = 'A2C'
 
 
-class DDPGAgent(BaseAgent):
+class ReplayBuffer:
+    """
+    Experience Replay Buffer for off-policy learning (DDPG).
+    
+    Stores transitions (s, a, r, s', done) and provides random sampling
+    for training to break temporal correlations.
+    
+    Attributes:
+        max_size: Maximum buffer capacity
+        ptr: Current write position (circular buffer)
+        size: Current number of stored transitions
+    """
+    
+    def __init__(self, state_dim: int, action_dim: int, max_size: int = 100000):
+        """
+        Initialize replay buffer.
+        
+        Args:
+            state_dim: State space dimension
+            action_dim: Action space dimension
+            max_size: Maximum buffer size (default: 100,000)
+        """
+        self.max_size = max_size
+        self.ptr = 0
+        self.size = 0
+        
+        self.states = np.zeros((max_size, state_dim), dtype=np.float32)
+        self.actions = np.zeros((max_size, action_dim), dtype=np.float32)
+        self.rewards = np.zeros((max_size, 1), dtype=np.float32)
+        self.next_states = np.zeros((max_size, state_dim), dtype=np.float32)
+        self.dones = np.zeros((max_size, 1), dtype=np.float32)
+    
+    def add(self, state: np.ndarray, action: np.ndarray, reward: float,
+            next_state: np.ndarray, done: bool) -> None:
+        """
+        Add a transition to the buffer.
+        
+        Args:
+            state: Current state
+            action: Action taken
+            reward: Reward received
+            next_state: Next state
+            done: Whether episode ended
+        """
+        self.states[self.ptr] = state
+        self.actions[self.ptr] = action
+        self.rewards[self.ptr] = reward
+        self.next_states[self.ptr] = next_state
+        self.dones[self.ptr] = done
+        
+        self.ptr = (self.ptr + 1) % self.max_size
+        self.size = min(self.size + 1, self.max_size)
+    
+    def sample(self, batch_size: int) -> Tuple[torch.Tensor, ...]:
+        """
+        Sample a random batch of transitions.
+        
+        Args:
+            batch_size: Number of transitions to sample
+            
+        Returns:
+            Tuple of (states, actions, rewards, next_states, dones) as tensors
+        """
+        indices = np.random.randint(0, self.size, size=batch_size)
+        
+        return (
+            torch.FloatTensor(self.states[indices]),
+            torch.FloatTensor(self.actions[indices]),
+            torch.FloatTensor(self.rewards[indices]),
+            torch.FloatTensor(self.next_states[indices]),
+            torch.FloatTensor(self.dones[indices])
+        )
+    
+    def __len__(self) -> int:
+        """Return current buffer size."""
+        return self.size
+
+
+class OUNoise:
+    """
+    Ornstein-Uhlenbeck process for exploration in continuous action spaces.
+    
+    Generates temporally correlated noise for better exploration than
+    independent Gaussian noise.
+    
+    Formula: dx = theta * (mu - x) * dt + sigma * dW
+    """
+    
+    def __init__(self, action_dim: int, mu: float = 0.0, theta: float = 0.15,
+                 sigma: float = 0.2):
+        """
+        Initialize OU noise process.
+        
+        Args:
+            action_dim: Dimension of action space
+            mu: Mean of the process (default: 0.0)
+            theta: Mean reversion rate (default: 0.15)
+            sigma: Volatility/noise scale (default: 0.2)
+        """
+        self.action_dim = action_dim
+        self.mu = mu
+        self.theta = theta
+        self.sigma = sigma
+        self.state = np.ones(self.action_dim) * self.mu
+        self.reset()
+    
+    def reset(self) -> None:
+        """Reset the internal state to the mean."""
+        self.state = np.ones(self.action_dim) * self.mu
+    
+    def sample(self) -> np.ndarray:
+        """
+        Generate noise sample.
+        
+        Returns:
+            Noise array of shape (action_dim,)
+        """
+        x = self.state
+        dx = self.theta * (self.mu - x) + self.sigma * np.random.randn(self.action_dim)
+        self.state = x + dx
+        return self.state
+
+
+class DDPGActor(nn.Module):
+    """
+    DDPG Actor Network (Policy).
+    
+    Maps states to deterministic actions in continuous space.
+    Output is bounded to [-1, 1] using Tanh activation.
+    
+    Architecture: state → 256 → ReLU → 128 → ReLU → action_dim → Tanh
+    """
+    
+    def __init__(self, state_dim: int, action_dim: int, hidden1: int = 256,
+                 hidden2: int = 128):
+        """
+        Initialize DDPG actor network.
+        
+        Args:
+            state_dim: State space dimension
+            action_dim: Action space dimension
+            hidden1: First hidden layer size (default: 256)
+            hidden2: Second hidden layer size (default: 128)
+        """
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden1),
+            nn.ReLU(),
+            nn.Linear(hidden1, hidden2),
+            nn.ReLU(),
+            nn.Linear(hidden2, action_dim),
+            nn.Tanh()
+        )
+    
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass to get action.
+        
+        Args:
+            state: State tensor of shape (batch, state_dim)
+            
+        Returns:
+            Action tensor of shape (batch, action_dim) in range [-1, 1]
+        """
+        return self.network(state)
+
+
+class DDPGCritic(nn.Module):
+    """
+    DDPG Critic Network (Q-function).
+    
+    Estimates Q(s, a) - the expected return from taking action a in state s.
+    Concatenates state and action as input.
+    
+    Architecture: [state, action] → 256 → ReLU → 128 → ReLU → 1 (Q-value)
+    """
+    
+    def __init__(self, state_dim: int, action_dim: int, hidden1: int = 256,
+                 hidden2: int = 128):
+        """
+        Initialize DDPG critic network.
+        
+        Args:
+            state_dim: State space dimension
+            action_dim: Action space dimension
+            hidden1: First hidden layer size (default: 256)
+            hidden2: Second hidden layer size (default: 128)
+        """
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden1),
+            nn.ReLU(),
+            nn.Linear(hidden1, hidden2),
+            nn.ReLU(),
+            nn.Linear(hidden2, 1)
+        )
+    
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass to get Q-value.
+        
+        Args:
+            state: State tensor of shape (batch, state_dim)
+            action: Action tensor of shape (batch, action_dim)
+            
+        Returns:
+            Q-value tensor of shape (batch, 1)
+        """
+        x = torch.cat([state, action], dim=1)
+        return self.network(x)
+
+
+class DDPGAgent:
     """
     Deep Deterministic Policy Gradient (DDPG) Agent.
     
-    Inherits from BaseAgent with DDPG-specific initialization.
-    Uses the same network architecture as BaseAgent.
+    Proper DDPG implementation with:
+    - Separate actor and critic networks
+    - Target networks for both actor and critic
+    - Experience replay buffer
+    - Ornstein-Uhlenbeck noise for exploration
+    - Off-policy learning
+    
+    Reference: Lillicrap et al. (2015) "Continuous control with deep RL"
+    
+    Attributes:
+        actor: Main actor network (policy)
+        actor_target: Target actor network
+        critic: Main critic network (Q-function)
+        critic_target: Target critic network
+        replay_buffer: Experience replay buffer
+        noise: OU noise process for exploration
+        
+    Example:
+        >>> agent = DDPGAgent(state_dim=181, action_dim=30)
+        >>> state = np.random.randn(181).astype(np.float32)
+        >>> action = agent.get_action(state, add_noise=True)
+        >>> action.shape
+        (30,)
     """
     
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(
+        self,
+        state_dim: int = STATE_DIM,
+        action_dim: int = ACTION_DIM,
+        hidden1: int = 256,
+        hidden2: int = 128,
+        buffer_size: int = 100000,
+        tau: float = 0.001,
+        device: Optional[torch.device] = None
+    ):
+        """
+        Initialize DDPG agent with all components.
+        
+        Args:
+            state_dim: State space dimension (default: 181)
+            action_dim: Action space dimension (default: 30)
+            hidden1: First hidden layer size (default: 256)
+            hidden2: Second hidden layer size (default: 128)
+            buffer_size: Replay buffer size (default: 100,000)
+            tau: Soft update parameter for target networks (default: 0.001)
+            device: Computation device (default: auto-detect)
+        """
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.tau = tau
+        self.device = device if device is not None else get_device()
         self.agent_type = 'DDPG'
+        
+        # Create actor networks
+        self.actor = DDPGActor(state_dim, action_dim, hidden1, hidden2).to(self.device)
+        self.actor_target = DDPGActor(state_dim, action_dim, hidden1, hidden2).to(self.device)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        
+        # Create critic networks
+        self.critic = DDPGCritic(state_dim, action_dim, hidden1, hidden2).to(self.device)
+        self.critic_target = DDPGCritic(state_dim, action_dim, hidden1, hidden2).to(self.device)
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        
+        # Replay buffer
+        self.replay_buffer = ReplayBuffer(state_dim, action_dim, buffer_size)
+        
+        # Exploration noise
+        self.noise = OUNoise(action_dim)
+    
+    def get_action(self, state: Union[np.ndarray, torch.Tensor],
+                   add_noise: bool = False) -> np.ndarray:
+        """
+        Get action from state for inference or exploration.
+        
+        Args:
+            state: State vector of shape (state_dim,) or (batch, state_dim)
+            add_noise: Whether to add OU noise for exploration (default: False)
+            
+        Returns:
+            np.ndarray: Action vector of shape (action_dim,) in range [-1, 1]
+            
+        Example:
+            >>> agent = DDPGAgent()
+            >>> state = np.random.randn(181).astype(np.float32)
+            >>> action = agent.get_action(state)
+            >>> action.shape
+            (30,)
+            >>> np.all((action >= -1) & (action <= 1))
+            True
+        """
+        self.actor.eval()
+        with torch.no_grad():
+            if isinstance(state, np.ndarray):
+                state = torch.FloatTensor(state).to(self.device)
+            
+            # Ensure batch dimension
+            if state.dim() == 1:
+                state = state.unsqueeze(0)
+            
+            action = self.actor(state).squeeze(0).cpu().numpy()
+            
+            if add_noise:
+                noise = self.noise.sample()
+                action = np.clip(action + noise, -1.0, 1.0)
+            
+            return action
+    
+    def soft_update(self, target: nn.Module, source: nn.Module) -> None:
+        """
+        Soft update target network parameters.
+        
+        θ_target = τ * θ_source + (1 - τ) * θ_target
+        
+        Args:
+            target: Target network to update
+            source: Source network to copy from
+        """
+        for target_param, source_param in zip(target.parameters(), source.parameters()):
+            target_param.data.copy_(
+                self.tau * source_param.data + (1.0 - self.tau) * target_param.data
+            )
+    
+    def update_target_networks(self) -> None:
+        """Soft update both actor and critic target networks."""
+        self.soft_update(self.actor_target, self.actor)
+        self.soft_update(self.critic_target, self.critic)
+    
+    def reset_noise(self) -> None:
+        """Reset OU noise process."""
+        self.noise.reset()
+    
+    def load_weights(self, path: str) -> None:
+        """
+        Load model weights from checkpoint.
+        
+        Args:
+            path: Path to .pth checkpoint file
+            
+        Raises:
+            FileNotFoundError: If checkpoint doesn't exist
+        """
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Checkpoint file not found: {path}")
+        
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+        
+        if 'actor_state_dict' in checkpoint:
+            self.actor.load_state_dict(checkpoint['actor_state_dict'])
+            self.actor_target.load_state_dict(checkpoint['actor_state_dict'])
+            
+        if 'critic_state_dict' in checkpoint:
+            self.critic.load_state_dict(checkpoint['critic_state_dict'])
+            self.critic_target.load_state_dict(checkpoint['critic_state_dict'])
+        
+        self.actor.eval()
+        self.critic.eval()
+    
+    def save_weights(self, path: str) -> None:
+        """
+        Save model weights to checkpoint.
+        
+        Args:
+            path: Path to save .pth checkpoint file
+        """
+        checkpoint = {
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'state_dim': self.state_dim,
+            'action_dim': self.action_dim
+        }
+        torch.save(checkpoint, path)
+    
+    def eval(self) -> None:
+        """Set all networks to evaluation mode."""
+        self.actor.eval()
+        self.critic.eval()
+        self.actor_target.eval()
+        self.critic_target.eval()
+    
+    def train(self, mode: bool = True) -> None:
+        """Set all networks to training mode."""
+        self.actor.train(mode)
+        self.critic.train(mode)
+        self.actor_target.train(mode)
+        self.critic_target.train(mode)
 
 
 def construct_state(
@@ -664,61 +1064,25 @@ def signal_gen(
         )
         
         # Get action from agent (returns array in [-1, 1]^num_tickers)
+        # These are portfolio weight signals, not execution orders
         action = agent.get_action(state)
         
-        # Map actions to share quantities: shares = round(action * h_max)
-        shares = np.round(action * h_max).astype(int)
-        
-        # Calculate total buy cost and apply cash constraint
-        buy_mask = shares > 0
-        if np.any(buy_mask):
-            buy_costs = shares[buy_mask] * prices[buy_mask]
-            total_buy_cost = np.sum(buy_costs)
-            
-            # Scale down if buy cost exceeds available cash
-            if total_buy_cost > cash and total_buy_cost > 0:
-                scale_factor = cash / total_buy_cost
-                shares[buy_mask] = np.floor(shares[buy_mask] * scale_factor).astype(int)
-        
-        # Process trades
+        # Store raw signals (portfolio weights from agent)
+        # trading_sim will convert these to actual trades
         for j, ticker in enumerate(tickers):
-            share_action = shares[j]
+            signal_value = float(action[j])  # Portfolio weight in [-1, 1]
             
-            if share_action == 0:
-                continue
-            
-            if share_action > 0:
-                # BUY action
-                trade_cost = share_action * prices[j]
-                if trade_cost <= cash and trade_cost > 0:
-                    signals.append({
-                        'time': current_date,
-                        'ticker': ticker,
-                        'action': 'BUY',
-                        'quantity': int(share_action)
-                    })
-                    cash -= trade_cost
-                    holdings[j] += share_action
-            else:
-                # SELL action
-                available_to_sell = int(holdings[j])
-                sell_qty = min(abs(share_action), available_to_sell)
-                if sell_qty > 0:
-                    signals.append({
-                        'time': current_date,
-                        'ticker': ticker,
-                        'action': 'SELL',
-                        'quantity': sell_qty
-                    })
-                    cash += sell_qty * prices[j]
-                    holdings[j] -= sell_qty
+            signals.append({
+                'time': current_date,
+                'ticker': ticker,
+                'signal': signal_value  # Raw agent output
+            })
     
-    # Create output DataFrame
+    # Create output DataFrame with signals
     if signals:
         signals_df = pd.DataFrame(signals)
-        signals_df['quantity'] = signals_df['quantity'].astype(int)
     else:
-        signals_df = pd.DataFrame(columns=['time', 'ticker', 'action', 'quantity'])
+        signals_df = pd.DataFrame(columns=['time', 'ticker', 'signal'])
     
     return signals_df
 

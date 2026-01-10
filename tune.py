@@ -514,6 +514,177 @@ def train_agent(
             rewards = []
             values = []
             log_probs = []
+    return agent
+
+
+def train_ddpg_agent(
+    agent: DDPGAgent,
+    actor_optimizer: torch.optim.Optimizer,
+    critic_optimizer: torch.optim.Optimizer,
+    train_df: pd.DataFrame,
+    features_df: pd.DataFrame,
+    tickers: List[str],
+    device: torch.device,
+    h_max: int = H_MAX,
+    batch_size: int = 64,
+    gamma: float = 0.99
+) -> DDPGAgent:
+    """
+    Train DDPG agent using off-policy learning with experience replay.
+    
+    DDPG Training Algorithm:
+    1. Collect experience into replay buffer (s, a, r, s', done)
+    2. Sample random mini-batches from buffer
+    3. Update critic to minimize TD error: (r + γ * Q'(s', μ'(s')) - Q(s, a))²
+    4. Update actor to maximize Q(s, μ(s))
+    5. Soft update target networks
+    
+    Args:
+        agent: DDPGAgent instance with replay buffer and target networks
+        actor_optimizer: Optimizer for actor network
+        critic_optimizer: Optimizer for critic network
+        train_df: Training OHLCV DataFrame
+        features_df: Features DataFrame from calc_features
+        tickers: List of ticker symbols
+        device: Computation device
+        h_max: Maximum shares per trade (default: 100)
+        batch_size: Mini-batch size for training (default: 64)
+        gamma: Discount factor (default: 0.99)
+        
+    Returns:
+        Trained DDPG agent
+    """
+    agent.actor.train()
+    agent.critic.train()
+    
+    # Get unique dates in training set
+    unique_dates = sorted(train_df['time'].unique())
+    
+    if len(unique_dates) < 2:
+        return agent
+    
+    # Initialize portfolio state
+    balance = INITIAL_CASH
+    holdings = np.zeros(len(tickers), dtype=np.float32)
+    
+    # Reset noise process
+    agent.reset_noise()
+    
+    # Collect experience and train
+    for t in range(len(unique_dates) - 1):
+        date = unique_dates[t]
+        next_date = unique_dates[t + 1]
+        
+        # Get current prices and features
+        prices = get_prices_for_date(train_df, date, tickers)
+        macd, rsi, cci, adx = get_features_for_date(features_df, date, tickers)
+        
+        # Construct state vector
+        state = construct_state(
+            balance=balance,
+            prices=prices,
+            holdings=holdings,
+            macd=macd,
+            rsi=rsi,
+            cci=cci,
+            adx=adx
+        )
+        
+        # Get action with exploration noise
+        action = agent.get_action(state, add_noise=True)
+        
+        # Execute actions
+        new_balance, new_holdings = execute_actions(
+            action, balance, holdings, prices, h_max
+        )
+        
+        # Get next state
+        next_prices = get_prices_for_date(train_df, next_date, tickers)
+        next_macd, next_rsi, next_cci, next_adx = get_features_for_date(
+            features_df, next_date, tickers
+        )
+        
+        next_state = construct_state(
+            balance=new_balance,
+            prices=next_prices,
+            holdings=new_holdings,
+            macd=next_macd,
+            rsi=next_rsi,
+            cci=next_cci,
+            adx=next_adx
+        )
+        
+        # Compute reward
+        current_value = compute_portfolio_value(balance, holdings, prices)
+        next_value = compute_portfolio_value(new_balance, new_holdings, next_prices)
+        reward = (next_value - current_value) / INITIAL_CASH * 100
+        
+        # Check if episode done (last step)
+        done = (t == len(unique_dates) - 2)
+        
+        # Add transition to replay buffer
+        agent.replay_buffer.add(state, action, reward, next_state, done)
+        
+        # Update portfolio state
+        balance = new_balance
+        holdings = new_holdings
+        
+        # Train from replay buffer if we have enough samples
+        if len(agent.replay_buffer) >= batch_size:
+            # Sample mini-batch
+            batch_states, batch_actions, batch_rewards, batch_next_states, batch_dones = \
+                agent.replay_buffer.sample(batch_size)
+            
+            batch_states = batch_states.to(device)
+            batch_actions = batch_actions.to(device)
+            batch_rewards = batch_rewards.to(device)
+            batch_next_states = batch_next_states.to(device)
+            batch_dones = batch_dones.to(device)
+            
+            # ============================================================
+            # Update Critic (Q-function)
+            # ============================================================
+            with torch.no_grad():
+                # Get target actions from target actor
+                target_next_actions = agent.actor_target(batch_next_states)
+                
+                # Compute target Q-values
+                target_q_values = agent.critic_target(batch_next_states, target_next_actions)
+                
+                # Bellman backup: y = r + γ * Q'(s', μ'(s')) * (1 - done)
+                target_q = batch_rewards + gamma * target_q_values * (1 - batch_dones)
+            
+            # Current Q-values
+            current_q = agent.critic(batch_states, batch_actions)
+            
+            # Critic loss: MSE between current and target Q-values
+            critic_loss = torch.nn.functional.mse_loss(current_q, target_q)
+            
+            # Update critic
+            critic_optimizer.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent.critic.parameters(), 1.0)
+            critic_optimizer.step()
+            
+            # ============================================================
+            # Update Actor (Policy)
+            # ============================================================
+            # Get actions from current actor
+            actor_actions = agent.actor(batch_states)
+            
+            # Actor loss: negative Q-value (we want to maximize Q(s, μ(s)))
+            actor_loss = -agent.critic(batch_states, actor_actions).mean()
+            
+            # Update actor
+            actor_optimizer.zero_grad()
+            actor_loss.backward()
+            torch.nn.utils.clip_grad_norm_(agent.actor.parameters(), 1.0)
+            actor_optimizer.step()
+            
+            # ============================================================
+            # Soft Update Target Networks
+            # ============================================================
+            agent.update_target_networks()
     
     return agent
 
@@ -708,19 +879,35 @@ def tune(phase: str = 'limited') -> Dict:
             device=device
         )
 
-        # Create optimizer
-        optimizer = torch.optim.Adam(agent.parameters(), lr=LEARNING_RATE)
-
-        # Train agent
-        agent = train_agent(
-            agent=agent,
-            optimizer=optimizer,
-            train_df=train_df,
-            features_df=features_df,
-            tickers=tickers,
-            device=device,
-            h_max=H_MAX
-        )
+        # Train agent with appropriate training function
+        if agent_type == 'ddpg':
+            # DD PG requires separate optimizers for actor and critic
+            actor_optimizer = torch.optim.Adam(agent.actor.parameters(), lr=LEARNING_RATE)
+            critic_optimizer = torch.optim.Adam(agent.critic.parameters(), lr=LEARNING_RATE * 10)
+            
+            agent = train_ddpg_agent(
+                agent=agent,
+                actor_optimizer=actor_optimizer,
+                critic_optimizer=critic_optimizer,
+                train_df=train_df,
+                features_df=features_df,
+                tickers=tickers,
+                device=device,
+                h_max=H_MAX
+            )
+        else:
+            # PPO and A2C use on-policy training
+            optimizer = torch.optim.Adam(agent.parameters(), lr=LEARNING_RATE)
+            
+            agent = train_agent(
+                agent=agent,
+                optimizer=optimizer,
+                train_df=train_df,
+                features_df=features_df,
+                tickers=tickers,
+                device=device,
+                h_max=H_MAX
+            )
 
         # Validate agent
         sharpe = validate_agent(
@@ -748,7 +935,12 @@ def tune(phase: str = 'limited') -> Dict:
 
     # Save best agent weights
     model_path = 'best_agent.pth'
-    torch.save({'state_dict': best_agent.state_dict()}, model_path)
+    if best_agent_type == 'ddpg':
+        # DDPG uses custom save_weights method
+        best_agent.save_weights(model_path)
+    else:
+        # PPO and A2C use standard state_dict
+        torch.save({'state_dict': best_agent.state_dict()}, model_path)
     print(f"Saved model weights to: {model_path}")
 
     # Prepare parameters dictionary

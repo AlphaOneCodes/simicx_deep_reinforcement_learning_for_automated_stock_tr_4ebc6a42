@@ -824,10 +824,9 @@ def convert_signals_to_trades(
                 target_qtys[t] = qty
         
         # 3. Generate Rebalancing Orders
-        # IMPORTANT: Sort tickers for deterministic order (sets are non-deterministic)
         active_tickers = set(target_qtys.keys()) | {t for t, q in current_positions.items() if q != 0}
         
-        for ticker in sorted(active_tickers):  # Sort for reproducibility
+        for ticker in active_tickers:
             tgt_qty = target_qtys.get(ticker, 0.0)
             cur_qty = current_positions.get(ticker, 0.0)
             
@@ -1113,6 +1112,25 @@ def trading_sim(
         notes = execution_note.strip() if execution_note else ''
         realized_pnl = 0.0
         executed_qty = target_qty
+        
+        # Handle quantity=0 as signal to close entire position (for daily rebalancing)
+        if target_qty == 0 and position.quantity != 0:
+            # Close entire position
+            current_qty = position.quantity
+            if current_qty > 0:
+                # Close long position -> SELL
+                action = 'sell'
+                executed_qty = current_qty
+            else:
+                # Close short position -> BUY
+                action = 'buy'
+                executed_qty = abs(current_qty)
+            
+            # Recalculate with actual close quantity
+            trade_value = executed_qty * exec_price
+            commission = trade_value * commission_rate
+            slippage_cost = abs(exec_price - target_price) * executed_qty
+            notes = 'Closing position (daily rebalance)'
         
         if action == 'buy':
             total_cost = trade_value + commission

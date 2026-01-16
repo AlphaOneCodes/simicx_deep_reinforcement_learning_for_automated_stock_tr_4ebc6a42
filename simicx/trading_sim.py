@@ -1113,25 +1113,6 @@ def trading_sim(
         realized_pnl = 0.0
         executed_qty = target_qty
         
-        # Handle quantity=0 as signal to close entire position (for daily rebalancing)
-        if target_qty == 0 and position.quantity != 0:
-            # Close entire position
-            current_qty = position.quantity
-            if current_qty > 0:
-                # Close long position -> SELL
-                action = 'sell'
-                executed_qty = current_qty
-            else:
-                # Close short position -> BUY
-                action = 'buy'
-                executed_qty = abs(current_qty)
-            
-            # Recalculate with actual close quantity
-            trade_value = executed_qty * exec_price
-            commission = trade_value * commission_rate
-            slippage_cost = abs(exec_price - target_price) * executed_qty
-            notes = 'Closing position (daily rebalance)'
-        
         if action == 'buy':
             total_cost = trade_value + commission
             
@@ -1160,24 +1141,56 @@ def trading_sim(
                     notes = 'Insufficient cash'
                     executed_qty = 0
                     
-            # Check max position constraint
+            # Check max position constraint using ABSOLUTE VALUES
             if executed_qty > 0:
-                new_position_value = (position.quantity + executed_qty) * exec_price
-                if new_position_value > current_portfolio_value * max_position_pct:
-                    # Use current market price for existing position valuation
-                    current_price = current_prices.get(ticker, exec_price)
-                    max_addl_value = current_portfolio_value * max_position_pct - position.quantity * current_price
-                    if max_addl_value > min_trade_value:
-                        executed_qty = max_addl_value / exec_price
-                        trade_value = executed_qty * exec_price
-                        commission = trade_value * commission_rate
-                        total_cost = trade_value + commission
-                        status = 'EXECUTED'
-                        notes = 'Reduced due to position limit'
-                    else:
-                        status = 'REJECTED'
-                        notes = 'Position limit reached'
-                        executed_qty = 0
+                # Use current market price for existing position valuation
+                current_price = current_prices.get(ticker, exec_price)
+                
+                # Calculate absolute position values (treats long/short symmetrically)
+                current_abs_position_value = abs(position.quantity * current_price)
+                new_position_qty = position.quantity + executed_qty
+                new_abs_position_value = abs(new_position_qty * exec_price)
+                
+                # Use absolute portfolio value to handle net-short portfolios correctly
+                abs_portfolio_value = abs(current_portfolio_value)
+                
+                # CRITICAL: Allow covering shorts (risk reduction) even if over limit
+                # Only enforce limit when INCREASING risk
+                is_covering_short = position.quantity < 0 and new_position_qty <= 0
+                is_reducing_risk = new_abs_position_value < current_abs_position_value
+                
+                # Only check limit when NOT reducing risk
+                if not (is_covering_short or is_reducing_risk):
+                    if new_abs_position_value > abs_portfolio_value * max_position_pct:
+                        # For flipping (short→long), closing short frees up space
+                        if position.quantity < 0 and new_position_qty > 0:
+                            # Flipping: can use full limit for new long position
+                            max_long_value = abs_portfolio_value * max_position_pct
+                            max_long_qty = max_long_value / exec_price
+                            # Need to cover short first, then add long
+                            total_needed = abs(position.quantity) + max_long_qty
+                            executed_qty = total_needed
+                            trade_value = executed_qty * exec_price
+                            commission = trade_value * commission_rate
+                            total_cost = trade_value + commission
+                            status = 'EXECUTED'
+                            notes = 'Reduced due to position limit (flip allowed)'
+                        else:
+                            # Just adding to existing long position
+                            max_addl_value = (abs_portfolio_value * max_position_pct 
+                                             - current_abs_position_value)
+                            
+                            if max_addl_value > min_trade_value:
+                                executed_qty = max_addl_value / exec_price
+                                trade_value = executed_qty * exec_price
+                                commission = trade_value * commission_rate
+                                total_cost = trade_value + commission
+                                status = 'EXECUTED'
+                                notes = 'Reduced due to position limit'
+                            else:
+                                status = 'REJECTED'
+                                notes = 'Position limit reached'
+                                executed_qty = 0
             
             if executed_qty > 0:
                 # Check if we're covering a short position
@@ -1246,6 +1259,62 @@ def trading_sim(
                 # current_position_qty < target_qty and allow_short=True
                 # Sell what we have + create short for remainder
                 executed_qty = target_qty
+            
+            # Check max position constraint for SHORT positions (same as BUY logic)
+            if executed_qty > 0 and allow_short:
+                # Calculate if this sell will create or increase a short position
+                potential_short_qty = max(0, executed_qty - max(0, current_position_qty))
+                
+                if potential_short_qty > 0:
+                    # This sell will create/increase short position - check limit
+                    current_price = current_prices.get(ticker, exec_price)
+                    current_abs_position_value = abs(position.quantity * current_price)
+                    
+                    # Calculate new position after sell (will be negative for short)
+                    new_position_qty = current_position_qty - executed_qty
+                    new_abs_position_value = abs(new_position_qty * exec_price)
+                    
+                    # Use absolute portfolio value to handle net-short portfolios
+                    abs_portfolio_value = abs(current_portfolio_value)
+                    
+                    # CRITICAL: Allow closing longs (risk reduction) even if over limit
+                    is_closing_long = current_position_qty > 0 and new_position_qty >= 0
+                    is_reducing_risk = new_abs_position_value < current_abs_position_value
+                    
+                    # Only check limit when NOT reducing risk
+                    if not (is_closing_long or is_reducing_risk):
+                        if new_abs_position_value > abs_portfolio_value * max_position_pct:
+                            # For flipping (long→short), closing long frees up space
+                            if current_position_qty > 0 and new_position_qty < 0:
+                                # Flipping: can use full limit for new short position
+                                max_short_value = abs_portfolio_value * max_position_pct
+                                max_short_qty = max_short_value / exec_price
+                                # Need to close long first, then add short
+                                total_needed = current_position_qty + max_short_qty
+                                executed_qty = total_needed
+                                status = 'EXECUTED'
+                                notes = 'Reduced due to position limit (flip allowed)'
+                            else:
+                                # Just adding to existing short position
+                                max_short_value = abs_portfolio_value * max_position_pct
+                                max_addl_short_value = max_short_value - current_abs_position_value
+                                
+                                if max_addl_short_value > min_trade_value:
+                                    # Can create some short, just not full amount
+                                    max_short_qty = max_addl_short_value / exec_price
+                                    executed_qty = max(0, current_position_qty) + max_short_qty
+                                    status = 'EXECUTED'
+                                    notes = 'Reduced due to position limit'
+                                else:
+                                    # Can only close existing long, no new short
+                                    if current_position_qty > 0:
+                                        executed_qty = current_position_qty
+                                        status = 'EXECUTED'
+                                        notes = 'Reduced to close long only (short limit reached)'
+                                    else:
+                                        status = 'REJECTED'
+                                        notes = 'Position limit reached'
+                                        executed_qty = 0
             
             if executed_qty > 0:
                 # Case 1: Selling from long position
